@@ -476,6 +476,11 @@ export async function execute(
     timeoutSec,
     graceSec,
     onLog: wrappedOnLog,
+    // Paperclip heartbeat persists processPid via ctx.onSpawn for orphan-reaper
+    // survival during long, quiet local inference runs.
+    onSpawn: ctx.onSpawn
+      ? async (meta) => ctx.onSpawn!({ pid: meta.pid, startedAt: meta.startedAt })
+      : undefined,
   });
 
   // ── Parse output ───────────────────────────────────────────────────────
