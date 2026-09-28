@@ -285,11 +285,10 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     };
   }
 
-  // Extract cost
-  const costMatch = combined.match(COST_REGEX);
-  if (costMatch?.[1]) {
-    result.costUsd = parseFloat(costMatch[1]);
-  }
+  // Cost scraping DISABLED for Melting Face local stack (2026-07-13).
+  // COST_REGEX false-positives on research prose ("cost $700") and inflated the
+  // Paperclip Inference Ledger for free local Ollama runs (0 tokens, unknown billing).
+  // Do not set result.costUsd. Re-enable only for metered cloud adapters.
 
   // Check for error patterns in stderr
   if (stderr.trim()) {
