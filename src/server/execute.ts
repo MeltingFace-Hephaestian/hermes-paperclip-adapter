@@ -37,6 +37,7 @@ import {
   DEFAULT_GRACE_SEC,
   DEFAULT_MODEL,
   VALID_PROVIDERS,
+  COST_REGEX,
 } from "../shared/constants.js";
 
 import {
@@ -202,8 +203,140 @@ const SESSION_ID_REGEX_LEGACY = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i
 const TOKEN_USAGE_REGEX =
   /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
 
-/** Regex to extract cost from Hermes output. */
-const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
+// ---------------------------------------------------------------------------
+// Hard spend cap (default $0 — block paid calls)
+// ---------------------------------------------------------------------------
+
+/** Default hard spend cap in USD. $0 blocks any estimated/reported paid cost. */
+const DEFAULT_SPEND_CAP_USD = 0;
+
+/** Env var: set to a number > 0 to allow reported/estimated cost up to that USD amount. */
+const SPEND_CAP_ENV = "HERMES_SPEND_CAP_USD";
+
+/**
+ * Cloud inference API key env names. Presence implies estimated cost may be > $0.
+ * Values are never logged.
+ */
+const PAID_INFERENCE_ENV_KEYS = [
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "OPENROUTER_API_KEY",
+  "ZAI_API_KEY",
+  "MOONSHOT_API_KEY",
+  "MINIMAX_API_KEY",
+  "HUGGINGFACE_API_KEY",
+  "HF_TOKEN",
+  "NOUS_API_KEY",
+  "GEMINI_API_KEY",
+  "GOOGLE_API_KEY",
+  "TOGETHER_API_KEY",
+  "FIREWORKS_API_KEY",
+  "GROQ_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "MISTRAL_API_KEY",
+  "XAI_API_KEY",
+] as const;
+
+/** Providers that are billed / metered (not free local inference). */
+const PAID_PROVIDERS = new Set<string>([
+  "openrouter",
+  "nous",
+  "openai-codex",
+  "copilot",
+  "copilot-acp",
+  "anthropic",
+  "huggingface",
+  "zai",
+  "kimi-coding",
+  "minimax",
+  "minimax-cn",
+  "kilocode",
+]);
+
+/**
+ * Resolve hard spend cap from HERMES_SPEND_CAP_USD.
+ * Missing / empty / invalid / negative → $0 (block paid calls).
+ * Only an explicit number > 0 raises the cap.
+ */
+function resolveSpendCapUsd(): number {
+  const raw = process.env[SPEND_CAP_ENV];
+  if (raw == null || String(raw).trim() === "") return DEFAULT_SPEND_CAP_USD;
+  const n = Number(String(raw).trim());
+  if (!Number.isFinite(n) || n < 0) return DEFAULT_SPEND_CAP_USD;
+  return n;
+}
+
+function isLocalBaseUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  const u = url.toLowerCase();
+  return (
+    u.includes("localhost") ||
+    u.includes("127.0.0.1") ||
+    u.includes("0.0.0.0") ||
+    u.includes(":11434") ||
+    u.includes("ollama")
+  );
+}
+
+/**
+ * Pre-run cost estimate for the spend cap.
+ * - Local / free paths → 0
+ * - Paid provider or paid API key present → "unknown" (fail-closed vs $0 cap)
+ * Never logs key material.
+ */
+function estimateRunCostUsd(opts: {
+  provider: string;
+  detectedProvider?: string;
+  env: Record<string, string>;
+  baseUrl?: string;
+}): number | "unknown" {
+  const baseUrl =
+    opts.baseUrl ||
+    opts.env.OPENAI_BASE_URL ||
+    opts.env.HERMES_BASE_URL ||
+    opts.env.OLLAMA_HOST ||
+    "";
+  const detected = (opts.detectedProvider || "").toLowerCase();
+  // Free local inference (Ollama / local providers) — estimated $0
+  if (
+    isLocalBaseUrl(baseUrl) ||
+    opts.provider === "ollama" ||
+    detected === "ollama" ||
+    detected === "local"
+  ) {
+    return 0;
+  }
+
+  const hasPaidKey = PAID_INFERENCE_ENV_KEYS.some((k) => {
+    const v = opts.env[k];
+    return typeof v === "string" && v.trim().length > 0;
+  });
+
+  if (PAID_PROVIDERS.has(opts.provider) || hasPaidKey) {
+    return "unknown";
+  }
+
+  return 0;
+}
+
+/** True when estimated/reported cost must block under the hard cap. */
+function exceedsSpendCap(
+  cost: number | "unknown" | undefined,
+  capUsd: number,
+): boolean {
+  if (cost === "unknown") {
+    // Cannot silently skip cost: unknown is only safe when cap explicitly allows spend (>0)
+    // and even then we still require a reported number post-run — pre-run unknown + cap>0
+    // is allowed through; post-run missing cost still fails closed below.
+    return capUsd <= 0;
+  }
+  if (cost === undefined) {
+    // Missing reported cost after a run that was allowed: fail closed always
+    // (caller decides when to pass undefined).
+    return true;
+  }
+  return cost > capUsd;
+}
 
 interface ParsedOutput {
   sessionId?: string;
@@ -285,10 +418,15 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     };
   }
 
-  // Cost scraping DISABLED for Melting Face local stack (2026-07-13).
-  // COST_REGEX false-positives on research prose ("cost $700") and inflated the
-  // Paperclip Inference Ledger for free local Ollama runs (0 tokens, unknown billing).
-  // Do not set result.costUsd. Re-enable only for metered cloud adapters.
+  // Extract structured cost only (shared COST_REGEX). Do not use free-text
+  // "cost $N" prose matches — those inflated the Inference Ledger on local runs.
+  const costMatch = combined.match(COST_REGEX);
+  if (costMatch?.[1]) {
+    const parsedCost = parseFloat(costMatch[1]);
+    if (Number.isFinite(parsedCost)) {
+      result.costUsd = parsedCost;
+    }
+  }
 
   // Check for error patterns in stderr
   if (stderr.trim()) {
@@ -433,10 +571,42 @@ export async function execute(
     // Non-fatal
   }
 
+  // ── Hard spend cap (default $0) ────────────────────────────────────────
+  const spendCapUsd = resolveSpendCapUsd();
+  const estimatedCost = estimateRunCostUsd({
+    provider: resolvedProvider,
+    detectedProvider: detectedConfig?.provider,
+    env,
+    baseUrl: detectedConfig?.baseUrl,
+  });
+  if (exceedsSpendCap(estimatedCost, spendCapUsd)) {
+    const msg =
+      `[hermes] BLOCKED by hard spend cap: estimated cost ` +
+      `${estimatedCost === "unknown" ? "unknown/paid" : `$${estimatedCost}`} ` +
+      `exceeds HERMES_SPEND_CAP_USD=$${spendCapUsd} ` +
+      `(default $0 blocks paid calls; set HERMES_SPEND_CAP_USD>0 to allow).\n`;
+    await ctx.onLog("stderr", msg);
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      provider: resolvedProvider,
+      model,
+      errorMessage: msg.trim(),
+      resultJson: {
+        blocked: true,
+        reason: "spend_cap",
+        phase: "estimated",
+        estimated_cost_usd: estimatedCost === "unknown" ? null : estimatedCost,
+        spend_cap_usd: spendCapUsd,
+      },
+    };
+  }
+
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
-    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""})\n`,
+    `[hermes] Starting Hermes Agent (model=${model}, provider=${resolvedProvider} [${resolvedFrom}], timeout=${timeoutSec}s${maxTurns ? `, max_turns=${maxTurns}` : ""}, spend_cap_usd=${spendCapUsd})\n`,
   );
   if (prevSessionId) {
     await ctx.onLog(
@@ -493,6 +663,60 @@ export async function execute(
     await ctx.onLog("stdout", `[hermes] Session: ${parsed.sessionId}\n`);
   }
 
+  // ── Enforce reported cost against hard spend cap ───────────────────────
+  // Paid paths that were allowed (cap > 0) must not silently skip cost:
+  // missing structured cost after a non-zero estimate risk fails closed.
+  const reportedCost = parsed.costUsd;
+  const paidPath =
+    estimatedCost === "unknown" ||
+    (typeof estimatedCost === "number" && estimatedCost > 0);
+  if (reportedCost !== undefined && exceedsSpendCap(reportedCost, spendCapUsd)) {
+    const msg =
+      `[hermes] BLOCKED by hard spend cap: reported cost $${reportedCost} ` +
+      `exceeds HERMES_SPEND_CAP_USD=$${spendCapUsd}.\n`;
+    await ctx.onLog("stderr", msg);
+    return {
+      exitCode: 1,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      provider: resolvedProvider,
+      model,
+      costUsd: reportedCost,
+      errorMessage: msg.trim(),
+      resultJson: {
+        blocked: true,
+        reason: "spend_cap",
+        phase: "reported",
+        cost_usd: reportedCost,
+        spend_cap_usd: spendCapUsd,
+        session_id: parsed.sessionId || null,
+      },
+    };
+  }
+  if (paidPath && reportedCost === undefined) {
+    const msg =
+      `[hermes] BLOCKED by hard spend cap: paid/unknown-cost run produced no ` +
+      `structured cost line (cannot silently skip cost). ` +
+      `HERMES_SPEND_CAP_USD=$${spendCapUsd}.\n`;
+    await ctx.onLog("stderr", msg);
+    return {
+      exitCode: 1,
+      signal: result.signal,
+      timedOut: result.timedOut,
+      provider: resolvedProvider,
+      model,
+      errorMessage: msg.trim(),
+      resultJson: {
+        blocked: true,
+        reason: "spend_cap_missing_cost",
+        phase: "reported",
+        cost_usd: null,
+        spend_cap_usd: spendCapUsd,
+        session_id: parsed.sessionId || null,
+      },
+    };
+  }
+
   // ── Build result ───────────────────────────────────────────────────────
   const executionResult: AdapterExecutionResult = {
     exitCode: result.exitCode,
@@ -510,8 +734,13 @@ export async function execute(
     executionResult.usage = parsed.usage;
   }
 
+  // Local free path with no structured cost line → record explicit $0 so ledger
+  // stays honest (not silently unset after re-enabling detection).
   if (parsed.costUsd !== undefined) {
     executionResult.costUsd = parsed.costUsd;
+  } else if (!paidPath) {
+    executionResult.costUsd = 0;
+    parsed.costUsd = 0;
   }
 
   // Summary from agent response

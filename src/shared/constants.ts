@@ -87,8 +87,13 @@ export const SESSION_ID_REGEX = /session[_ ](?:id|saved)[:\s]+([a-zA-Z0-9_-]+)/i
 export const TOKEN_USAGE_REGEX =
   /tokens?[:\s]+(\d+)\s*(?:input|in)\b.*?(\d+)\s*(?:output|out)\b/i;
 
-/** Regex to extract cost from Hermes output. */
-export const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
+/**
+ * Regex to extract structured cost lines from Hermes output.
+ * Line-anchored / keyed forms only — avoids prose false-positives like "cost $700/mo".
+ * Examples matched: "cost: $0.012", "Cost USD: 0.01", "spent: 1.23", "total_cost_usd: 0.05"
+ */
+export const COST_REGEX =
+  /(?:^|\n)\s*(?:total[_ ]?)?(?:cost(?:[_\s]*usd)?|spent)\s*[:=]\s*\$?([\d.]+)\b/i;
 
 /** Prefix used by Hermes for tool output lines. */
 export const TOOL_OUTPUT_PREFIX = "┊";
